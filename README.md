@@ -4,6 +4,7 @@ The R project should have the following folders: Import, Export, Derived, and Ma
 
 Steps:
 1. Unzip the GPR files
+2. Add them all to a single file in the Import folder called "2011 and 2013 AD and NDC RAW GPR files".
 2. Custom Functions.Rmd
 3. Data Preparation.Rmd
 4. Background Correction.Rmd
