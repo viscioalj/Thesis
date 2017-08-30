@@ -1,0 +1,96 @@
+---
+title: "Feature Selection"
+output:
+  word_document:
+  pdf_document:
+    toc: yes
+---
+
+```{r setup, include = F}
+knitr::opts_chunk$set(echo = T,
+                      eval = F,
+                      cache = F,
+                      message = F,
+                      warning = F)
+
+HOME <- "C:/Users/Owner/OneDrive/Thesis/Thesis R Project"
+DERIVED <- file.path(HOME, "Derived")
+MODELS <- file.path(DERIVED, "Models")
+WORKSPACES <- file.path(DERIVED, "WORKSPACES")
+EXPORT <- file.path(HOME, "Export")
+```
+
+```{r load.packages, include = F}
+library(tidyr)
+library(MASS)
+library(gridExtra)
+library(miscset)
+library(PAA)
+library(limma)
+library(knitr)
+library(doParallel)
+library(Hmisc)
+library(e1071)
+library(randomForest)
+library(kernlab)
+library(caret)
+library(dplyr)
+library(reshape2)
+library(ggplot2)
+```
+
+# Setup
+```{r load.workspaces}
+load(file = file.path(WORKSPACES,
+                      "Modeling-Ready Workspace.RData"))
+load(file = file.path(WORKSPACES,
+                      "Custom Functions.RData"))
+```
+
+# RF-RFE
+```{r}
+cl <- makeCluster(detectCores())
+registerDoParallel(cl)
+
+rfeCtrl.rerank$functions <- rf.functions
+
+rf.RFE <- rfe(x = as.matrix(data.training),
+              y = classVector.training,
+              rfeControl = rfeCtrl.rerank,
+              metric = "ROC",
+              ntree = 2000,
+              sizes = FSS.rerank)
+
+stopCluster(cl)
+```
+
+```{r}
+save(rf.RFE,
+     file = file.path(MODELS,
+                      "rf.RFE.RData"))
+```
+
+# SVM-RFE
+```{r}
+cl <- makeCluster(detectCores())
+registerDoParallel(cl)
+
+rfeCtrl.rerank$functions <- svm.functions
+
+svm.RFE <- rfe(x = data.training,
+               y = classVector.training,
+               rfeControl = rfeCtrl.rerank,
+               metric = "ROC",
+               sizes = FSS.rerank,
+               method = "svmLinear",
+               trControl = trCtrl.RFE)
+stopCluster(cl)
+
+save(svm.RFE,
+     file = file.path(MODELS,
+                      "svm.RFE.RData"))
+```
+
+
+
+

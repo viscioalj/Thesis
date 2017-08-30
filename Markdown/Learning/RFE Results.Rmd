@@ -1,0 +1,529 @@
+---
+title: "RFE Results, Extract Biomarkers, Tune Final Classifiers"
+output:
+  html_document:
+    toc: yes
+  pdf_document:
+    toc: yes
+  word_document: null
+---
+
+```{r setup, include = F}
+knitr::opts_chunk$set(echo = T,
+                      eval = T,
+                      cache = F,
+                      message = F,
+                      warning = F)
+
+HOME <- "C:/Users/Owner/OneDrive/Thesis/Thesis R Project"
+DERIVED <- file.path(HOME, "Derived")
+MODELS <- file.path(DERIVED, "Models")
+WORKSPACES <- file.path(DERIVED, "WORKSPACES")
+EXPORT <- file.path(HOME, "Export")
+```
+
+```{r load.packages, include = F}
+library(tidyr)
+library(MASS)
+library(gridExtra)
+library(miscset)
+library(PAA)
+library(limma)
+library(knitr)
+library(doParallel)
+library(Hmisc)
+library(e1071)
+library(randomForest)
+library(kernlab)
+library(caret)
+library(dplyr)
+library(reshape2)
+library(ggplot2)
+library(DT)
+```
+
+```{r load.workspaces, include = F}
+# Modeling-Ready Workspace
+load(file = file.path(WORKSPACES,
+                      "Modeling-Ready Workspace.RData"))
+
+# Custom Functions for Train and RFE
+load(file = file.path(WORKSPACES,
+                      "Custom Functions.RData"))
+
+# Load rf.RFE model
+load(file = file.path(MODELS,
+                      "rf.RFE.RData"))
+
+# Load svm.RFE model
+load(file = file.path(MODELS,
+                      "svm.RFE.RData"))
+```
+
+# Setup
+Change ROC labels to AUC.
+```{r}
+colnames(rf.RFE$results)[2] <- "AUC"
+colnames(rf.RFE$results)[7] <- "AUCSD"
+
+colnames(svm.RFE$results)[2] <- "AUC"
+colnames(svm.RFE$results)[7] <- "AUCSD"
+
+
+colnames(rf.RFE$resample)[2] <- "AUC"
+colnames(svm.RFE$resample)[2] <- "AUC"
+```
+
+# RF
+## RFE results
+Average performance measures among the 500 bootstrapped RF models per subset size.
+```{r, results = 'asis'}
+kable(rf.RFE$results[, c(1:6)], 
+      digits = 4,
+      format = "pandoc")
+```
+
+Plot of average performance per subset size.
+```{r}
+results.RF <- rf.RFE$results[, c(1:3, 5, 6)]
+
+meltedResults.RF <- melt(results.RF,
+                         id.vars = "Variables",
+                         variable.name = "Metric")
+```
+
+```{r}
+tiff(filename = file.path(EXPORT,
+                          "RF Eval Metric vs FSS.tiff"),
+     width = 2000,
+     height = 2000,
+     compression = "lzw",
+     res = 300)
+
+meltedResults.RF %>%
+  ggplot(aes(x = rep(c(1:38), 4),
+             y = value,
+             color = Metric)) +
+  geom_point() +
+  geom_line() +
+  theme_bw() +
+  xlab("Subset Size")  +
+  scale_x_continuous(breaks = c(1:38),
+                     labels = FSS.rerank) +
+  scale_color_brewer(name = "Evaluation Metric",
+                     type = "qual",
+                     palette = "Set1") +
+  theme(axis.title = element_text(face = "bold"),
+        legend.title = element_text(face = "bold"),
+        axis.title.x = element_blank()) +
+  coord_flip()
+
+dev.off()
+```
+
+Strip plot of AUC per subset size.
+```{r}
+resampPerf.RF <- rf.RFE$resample
+resampPerf.RF$Variables <- as.factor(resampPerf.RF$Variables)
+```
+
+```{r}
+tiff(filename = file.path(EXPORT,
+                          "RF strip plot AUC vs FSS.tiff"),
+     width = 2000,
+     height = 2000,
+     compression = "lzw",
+     res = 300)
+resampPerf.RF %>%
+  select(1:3, 5, 6) %>%
+  group_by(Variables) %>%
+  ggplot(aes(x = AUC,
+             y = Variables)) +
+  geom_point(size = .7,
+             color = "darkblue") +
+  theme_bw() +
+  scale_x_continuous(breaks = seq(.7, 1, by = .05)) +
+  theme(axis.title = element_text(face = "bold"),
+        axis.text.y = element_text(size = 8))
+dev.off()
+```
+
+Summary stats of resampling results
+```{r}
+var.AUC.RF <- 
+  resampPerf.RF %>%
+  select(1, 2) %>%
+  group_by(Variables) %>%
+  summarise(var = var(AUC))
+```
+
+
+## Extract biomarker.
+Determine optimal subset size.
+```{r}
+newSize.RF <- rf.RFE$results[tolerance(rf.RFE$results, "AUC", 
+                                       maximize = TRUE, 
+                                       tol = 1),
+                             "Variables"]
+biomarker.RF <- rf.functions$selectVar(rf.RFE$variables, 
+                                       size = newSize.RF)
+```
+
+Export RF biomarker training set to .csv for clustering.
+```{r}
+tempDF <- data.training[, biomarker.RF]
+colnames(tempDF) <-
+  colnames(tempDF) %>%
+  plyr::revalue(c("B07R02C17" = "PRELID2",
+                  "B18R07C13" = "DNAJC8",
+                  "B24R17C03" = "PCBD2",
+                  "B36R03C09" = "MGC24125",
+                  "B26R16C03" = "IL20",
+                  "B17R09C11" = "FRMD8"))
+write.csv(tempDF, 
+          file = file.path(EXPORT,
+                           "biomarker.RF.csv"),
+          row.names = T,
+          col.names = T)
+```
+
+RF biomarker metadata.
+```{r}
+metaData.RF <-
+  metaData.features %>%
+  filter(ID %in% biomarker.RF) %>%
+  select(c(Description, ID))
+metaData.RF <- metaData.RF[, c(2,1)]
+
+metaData.RF$Feature <- 
+  metaData.RF$ID %>%
+  plyr::revalue(c("B07R02C17" = "PRELID2",
+                  "B18R07C13" = "DNAJC8",
+                  "B24R17C03" = "PCBD2",
+                  "B36R03C09" = "MGC24125",
+                  "B26R16C03" = "IL20",
+                  "B17R09C11" = "FRMD8"))
+metaData.RF <- metaData.RF[, c(3, 1, 2)]
+```
+
+```{r, results = 'asis'}
+metaData.RF %>%
+  kable()
+```
+
+
+## Final classifier
+Parameter tuning and final model fit.
+```{r}
+cl <- makeCluster(detectCores())
+registerDoParallel(cl)
+
+set.seed(10)
+finalRF <- train(x = as.matrix(data.training[, biomarker.RF]),
+                 y = classVector.training,
+                 method = "rf",
+                 metric = "ROC",
+                 tuneLength = 5,
+                 trControl = trCtrl,
+                 ntree = 2000,
+                 importance = T,
+                 keep.inbag = T)
+stopCluster(cl)
+
+colnames(finalRF$results)[2] <- "AUC"
+colnames(finalRF$results)[7] <- "AUCSD"
+colnames(finalRF$resample)[1] <- "AUC"
+finalRF$perfNames[1] <- "AUC"
+```
+
+```{r}
+save(finalRF,
+     file = file.path(MODELS,
+                      "finalRF.RData"))
+
+save(biomarker.RF,
+     file = file.path(DERIVED,
+                      "biomarker.RF.RData"))
+```
+
+```{r, include = F}
+load(file = file.path(MODELS,
+                      "finalRF.RData"))
+```
+
+Tuning parameter performance.
+```{r, results = 'asis'}
+kable(finalRF$results[, c(1:6)], 
+      digits = 4,
+      format = "pandoc")
+```
+
+Internal OOB training performance of final RF model.
+```{r}
+finalRF$finalModel
+```
+
+Variable importance rankings.
+```{r, results = 'asis'}
+vImp.RF <- 
+  rf.functions$rank(finalRF$finalModel)
+colnames(vImp.RF)[1] <- "ID"
+
+vImp.RF <-
+  vImp.RF %>%
+  left_join(metaData.RF[, c("ID", "Feature")], 
+            by = "ID") %>%
+  select(7, 1, 5, 3, 4, 6)
+rownames(vImp.RF) <- NULL
+vImp.RF$Feature <- factor(vImp.RF$Feature, 
+                          levels = vImp.RF$Feature[order(vImp.RF$MeanDecreaseAccuracy)])
+
+vImp.RF %>%
+  kable(digits = 4,
+        format = "pandoc")
+```
+
+Variable importance plot.
+```{r}
+tiff(filename = file.path(EXPORT,
+                          "RF varImp plot.tiff"),
+     width = 1554,
+     height = 1159,
+     compression = "lzw",
+     res = 300)
+
+vImp.RF %>%
+  ggplot(aes(x = MeanDecreaseAccuracy,
+             y = Feature)) +
+  geom_point() +
+  theme_bw() +
+  xlab("Mean Decrease in Accuracy") +
+  ylab("Feature") +
+  theme(axis.title = element_text(face = "bold"))
+
+dev.off()
+```
+
+# SVM
+## RFE results
+Average performance measures among the 500 bootstrapped SVM models per subset size.
+```{r, results = 'asis'}
+kable(svm.RFE$results[, c(1:6)], 
+      digits = 4,
+      format = "pandoc")
+```
+
+Plot of average performance per subset size.
+```{r}
+tiff(filename = file.path(EXPORT,
+                          "SVM Eval Metric vs FSS.tiff"),
+     width = 2000,
+     height = 2000,
+     compression = "lzw",
+     res = 300)
+
+results.SVM <- svm.RFE$results[, c(1:3, 5, 6)]
+
+meltedResults.SVM <- melt(results.SVM,
+                          id.vars = "Variables",
+                          variable.name = "Metric")
+
+meltedResults.SVM %>%
+  ggplot(aes(x = rep(c(1:38), 4),
+             y = value,
+             color = Metric)) +
+  geom_point() +
+  geom_line() +
+  theme_bw() +
+  xlab("# Variables")  +
+  scale_x_continuous(breaks = c(1:38),
+                     labels = FSS.rerank) +
+  scale_color_brewer(name = "Evaluation Metric",
+                     type = "qual",
+                     palette = "Set1") +
+  theme(axis.title = element_text(face = "bold"),
+        legend.title = element_text(face = "bold"),
+        axis.title.x = element_blank()) +
+  coord_flip()
+
+dev.off()
+```
+
+```{r}
+resampPerf.SVM <- svm.RFE$resample
+resampPerf.SVM$Variables <- as.factor(resampPerf.SVM$Variables)
+```
+
+Strip plot of AUC per subset size.
+```{r}
+tiff(filename = file.path(EXPORT,
+                          "SVM strip plot AUC vs FSS.tiff"),
+     width = 2000,
+     height = 2000,
+     compression = "lzw",
+     res = 300)
+
+resampPerf.SVM %>%
+  select(1:3, 5, 6) %>%
+  group_by(Variables) %>%
+  ggplot(aes(x = AUC,
+             y = Variables)) +
+  geom_point(size = .7,
+             color = "darkblue") +
+  theme_bw() +
+  scale_x_continuous(breaks = seq(.7, 1, by = .05)) +
+  theme(axis.title = element_text(face = "bold"),
+        axis.text.y = element_text(size = 8))
+dev.off()
+```
+
+Summary stats of resampling results
+```{r}
+var.AUC.SVM <- 
+  resampPerf.SVM %>%
+  select(1, 2) %>%
+  group_by(Variables) %>%
+  summarise(var = var(AUC))
+```
+
+```{r, results = 'asis'}
+var.AUC.SVM %>%
+  datatable()
+```
+
+
+## Extract Biomarker
+```{r}
+newSize.SVM <- svm.RFE$results[tolerance(svm.RFE$results[1:29, ], 
+                                         "AUC",
+                                         maximize = TRUE, 
+                                         tol = 1),
+                               "Variables"]
+biomarker.SVM <- svm.functions$selectVar(svm.RFE$variables, 
+                                         size = newSize.SVM)
+```
+
+Export SVM biomarker training set to .csv for clustering.
+```{r}
+tempDF <- data.training[, biomarker.SVM]
+colnames(tempDF) <-
+  colnames(tempDF) %>%
+  plyr::revalue(c("B02R19C01" = "GTF2I",
+                  "B35R11C21" = "LGALS1",
+                  "B17R09C11" = "FRMD8",
+                  "B21R12C15" = "PHF15",
+                  "B24R17C03" = "PCBD2",
+                  "B28R16C01" = "IL4",
+                  "B25R11C21" = "PTCD2",
+                  "B26R16C03" = "IL20",
+                  "B15R12C09" = "ANKHD1"))
+write.csv(tempDF, 
+          file = file.path(EXPORT,
+                           "biomarker.SVM.csv"),
+          row.names = T,
+          col.names = T)
+```
+
+SVM biomarker metadata.
+```{r}
+metaData.SVM <-
+  metaData.features %>%
+  filter(ID %in% biomarker.SVM) %>%
+  dplyr::select(c(Description, ID))
+metaData.SVM <- metaData.SVM[, c(2,1)]
+
+metaData.SVM$Feature <- 
+  metaData.SVM$ID %>%
+  plyr::revalue(c("B02R19C01" = "GTF2I",
+                  "B35R11C21" = "LGALS1",
+                  "B17R09C11" = "FRMD8",
+                  "B21R12C15" = "PHF15",
+                  "B24R17C03" = "PCBD2",
+                  "B28R16C01" = "IL4",
+                  "B25R11C21" = "PTCD2",
+                  "B26R16C03" = "IL20",
+                  "B15R12C09" = "ANKHD1"))
+metaData.SVM <- metaData.SVM[, c(3, 1, 2)]
+```
+
+## Final Classifier
+Parameter tuning and final model fit.
+```{r}
+cl <- makeCluster(detectCores())
+registerDoParallel(cl)
+
+set.seed(10)
+finalSVM <- train(x = as.matrix(data.training[, biomarker.SVM]),
+                  y = classVector.training,
+                  method = "svmLinear",
+                  metric = "ROC",
+                  tuneGrid = expand.grid(C = 2^c(-2:2)),
+                  trControl = trCtrl)
+stopCluster(cl)
+
+colnames(finalSVM$results)[2] <- "AUC"
+colnames(finalSVM$results)[7] <- "AUCSD"
+colnames(finalSVM$resample)[1] <- "AUC"
+finalSVM$perfNames[1] <- "AUC"
+```
+
+```{r}
+save(finalSVM,
+     file = file.path(MODELS,
+                      "finalSVM.RData"))
+save(biomarker.SVM,
+     file = file.path(DERIVED,
+                      "biomarker.SVM.RData"))
+```
+
+Tuning parameter performance.
+```{r, results = 'asis'}
+kable(finalSVM$results[, c(1:6)], 
+      digits = 4,
+      format = "pandoc")
+```
+
+Final SVM Details.
+```{r}
+finalSVM$finalModel
+```
+
+Variable importance rankings.
+```{r, results = 'asis'}
+vImp.SVM <- svm.functions$rank(finalSVM)
+colnames(vImp.SVM)[1] <- "ID"
+vImp.SVM <-
+  vImp.SVM %>%
+  left_join(metaData.SVM[, c("ID", 
+                             "Feature")],
+            by = "ID") %>%
+  select(3, 1, 2)
+rownames(vImp.SVM) <- NULL
+vImp.SVM$Feature <- factor(vImp.SVM$Feature,
+                           levels = vImp.SVM$Feature[order(vImp.SVM$Overall)])
+
+vImp.SVM %>%
+  kable(digits = 4,
+        format = "pandoc")
+```
+
+Variable importance plot.
+```{r}
+tiff(filename = file.path(EXPORT,
+                          "SVM varImp plot.tiff"),
+     width = 1554,
+     height = 1159,
+     compression = "lzw",
+     res = 300)
+
+vImp.SVM %>%
+  ggplot(aes(x = Overall,
+             y = Feature)) +
+  geom_point() +
+  theme_bw() +
+  xlab("Influence on Weight Vector") +
+  ylab("Feature") +
+  theme(axis.title = element_text(face = "bold"))
+dev.off()
+
+```

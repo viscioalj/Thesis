@@ -1,0 +1,551 @@
+---
+title: "RLM Normalization"
+output:
+  html_document:
+    toc: yes
+  pdf_document:
+    toc: yes
+  word_document: null
+---
+
+```{r setup, include = F}
+knitr::opts_chunk$set(echo = F,
+                      eval = T,
+                      cache = F,
+                      message = F,
+                      warning = F)
+
+HOME <- "C:/Users/Owner/OneDrive/Thesis/Thesis R Project"
+DERIVED <- file.path(HOME, "Derived")
+MODELS <- file.path(DERIVED, "Models")
+WORKSPACES <- file.path(DERIVED, "WORKSPACES")
+EXPORT <- file.path(HOME, "Export")
+```
+
+```{r loadPackages, include = F}
+library(tidyr)
+library(MASS)
+library(gridExtra)
+library(miscset)
+library(PAA)
+library(limma)
+library(knitr)
+library(doParallel)
+library(Hmisc)
+library(e1071)
+library(randomForest)
+library(kernlab)
+library(caret)
+library(dplyr)
+library(reshape2)
+library(ggplot2)
+library(DT)
+```
+
+
+# Setup
+```{r importFiles}
+load(file.path(WORKSPACES,
+               "BC Output.RData"))
+load(file.path(WORKSPACES,
+               "Custom Functions.RData"))
+load(file.path(DERIVED, "samples.MA.RData"))
+```
+
+Add Block and random error columns to melted controls.
+```{r}
+meltedControls$Block <- rep(metaData.controls$Block,
+                            times = length(metaData.samples$ArrayID))
+
+meltedControls$e <- rnorm(length(meltedControls$value), 
+                          mean = 0,
+                          sd = 1)
+
+meltedControls$Sample <- as.factor(meltedControls$Sample)
+meltedControls$Feature <- as.factor(meltedControls$Feature)
+meltedControls$Block <- as.factor(meltedControls$Block)
+```
+
+Make dummy variables.
+```{r}
+dummies <- dummyVars(value ~ ., 
+                     data = meltedControls,
+                     fullRank = T)
+meltedControls.dummies <- predict(dummies, 
+                                  newdata = meltedControls)
+meltedControls.dummies <- as.data.frame(meltedControls.dummies)
+meltedControls.dummies$value <- meltedControls$value
+```
+
+# RLM Normalization
+```{r}
+rlm.train <- rlm(value ~ .,
+                 data = meltedControls.dummies)
+```
+
+```{r}
+coefs <- as.data.frame(coef(rlm.train))
+colnames(coefs) <- c("Value")
+coefs$Coefficient <- rownames(coefs)
+rownames(coefs) <- NULL
+coefs <- coefs[, c(2, 1)]
+```
+
+```{r}
+coefs.samples <-
+  coefs %>%
+  filter(grepl(pattern = "^(Sample)", 
+               Coefficient))
+coefs.blocks <-
+  coefs %>%
+  filter(grepl(pattern = "^(Block)", 
+               Coefficient))
+```
+
+```{r}
+coefs.samples$Coefficient <- gsub(pattern = "Sample.", 
+                                  replacement = "", 
+                                  x = coefs.samples$Coefficient)
+
+coefs.blocks$Coefficient <- gsub(pattern = "Block.", 
+                                 replacement = "", 
+                                 x = coefs.blocks$Coefficient)
+```
+
+```{r}
+coefs.samples <- rbind(coefs.samples,
+                       c("Coefficient" = "AD1",
+                         "Value" = 0))
+
+coefs.blocks <- rbind(coefs.blocks,
+                      c("Coefficient" = "1",
+                        "Value" = 0))
+```
+
+```{r}
+coefDF.samples <- coefs.samples
+coefDF.blocks <- coefs.blocks
+colnames(coefDF.samples) <- c("Sample", 
+                              "Coefficient")
+colnames(coefDF.blocks) <- c("Block", 
+                             "Coefficient")
+```
+
+Sample coefficients:
+```{r, results = 'asis'}
+kable(coefDF.samples, 
+      format = "pandoc")
+```
+
+Block coefficients:
+```{r, results = 'asis'}
+kable(coefDF.blocks, 
+      format = "pandoc")
+```
+
+```{r}
+meltedData.RLM <- meltedData
+meltedData.RLM$Block <- 
+  rep(metaData.features$Block,
+                            times = length(metaData.samples$ArrayID)) %>%
+  as.factor()
+```
+
+```{r}
+meltedData.RLM$Coef.Block <-
+  meltedData.RLM$Block %>%
+  sapply(FUN = function(x){
+    coefs.blocks$Value[which(coefs.blocks$Coefficient == x)]
+  })
+
+meltedData.RLM$Coef.Sample <-
+  meltedData.RLM$Sample %>%
+  sapply(FUN = function(x){
+    coefs.samples$Value[which(coefs.samples$Coefficient == x)]
+  })
+```
+
+```{r}
+meltedData.RLM$value <- as.numeric(meltedData.RLM$value)
+meltedData.RLM$Coef.Sample <- as.numeric(meltedData.RLM$Coef.Sample)
+meltedData.RLM$Coef.Block <- as.numeric(meltedData.RLM$Coef.Block)
+```
+
+RLM normalized expression is original value minus the sample and block coefficients.
+```{r}
+meltedData.RLM <-
+  meltedData.RLM %>%
+  mutate(value.normalized = value - Coef.Sample - Coef.Block)
+```
+
+Convert melted normalized data back to wide dataframe format.
+```{r}
+data.all <- dcast(meltedData.RLM, 
+                  formula = Sample ~ Feature, 
+                  value.var = "value.normalized")
+rownames(data.all) <- data.all$Sample
+data.all$Sample <- NULL
+```
+
+```{r}
+metaData.samples <- 
+  metaData.samples %>%
+  arrange(ArrayID, 
+          match(metaData.samples$ArrayID, 
+                rownames(data.all)))
+
+metaData.features <-
+  metaData.features %>%
+  arrange(ID, 
+          match(metaData.features$ID,
+                colnames(data.all)))
+```
+
+# Summary Statistics
+```{r}
+meltedData.RLM <-
+  meltedData.RLM %>%
+  mutate(Class = if_else(grepl(pattern = "^(AD)", 
+                               x = Sample, perl = T), 
+                         "AD", 
+                         "NDC"))
+```
+
+## Samples
+```{r}
+stats.samples <-
+  meltedData.RLM %>%
+  group_by(Sample) %>%
+  summarise(Min = min(value.normalized),
+            Max = max(value.normalized),
+            Mean = mean(value.normalized),
+            Median = median(value.normalized),
+            SD = sd(value.normalized),
+            Q1 = summary(value.normalized)[2],
+            Q3 = summary(value.normalized)[5],
+            IQR = IQR(value.normalized),
+            Outliers.high = sum(value.normalized > Q3 + (1.5 * IQR)),
+            Outliers.low = sum(value.normalized < Q1 - (1.5 * IQR)))
+```
+
+
+```{r, results = 'asis'}
+stats.samples %>%
+  datatable() %>%
+  formatRound(columns = colnames(stats.samples), digits = 4)
+```
+
+### AD sample stats
+```{r}
+stats.samples.AD <- 
+  meltedData.RLM %>%
+  filter(Class == "AD") %>%
+  group_by(Sample) %>%
+  summarise(Min = min(value.normalized),
+            Max = max(value.normalized),
+            Mean = mean(value.normalized),
+            Median = median(value.normalized),
+            SD = sd(value.normalized),
+            Q1 = summary(value.normalized)[2],
+            Q3 = summary(value.normalized)[5],
+            IQR = IQR(value.normalized),
+            Outliers.high = sum(value.normalized > Q3 + (1.5 * IQR)),
+            Outliers.low = sum(value.normalized < Q1 - (1.5 * IQR)))
+```
+
+```{r, results = 'asis'}
+stats.samples.AD %>%
+  datatable() %>%
+  formatRound(columns = colnames(stats.samples.AD), digits = 4)
+```
+
+### NDC sample stats
+```{r}
+stats.samples.NDC <- 
+  meltedData.RLM %>%
+  filter(Class == "NDC") %>%
+  group_by(Sample) %>%
+  summarise(Min = min(value.normalized),
+            Max = max(value.normalized),
+            Mean = mean(value.normalized),
+            Median = median(value.normalized),
+            SD = sd(value.normalized),
+            Q1 = summary(value.normalized)[2],
+            Q3 = summary(value.normalized)[5],
+            IQR = IQR(value.normalized),
+            Outliers.high = sum(value.normalized > Q3 + (1.5 * IQR)),
+            Outliers.low = sum(value.normalized < Q1 - (1.5 * IQR)))
+```
+
+```{r, results = 'asis'}
+stats.samples.NDC %>%
+  datatable() %>%
+  formatRound(columns = colnames(stats.samples.NDC), digits = 4)
+```
+
+### Average sample stats
+```{r}
+aveStats.samples <-
+  stats.samples %>%
+  summarise(Min = mean(Min),
+            Max = mean(Max),
+            Mean = mean(Mean),
+            Median = mean(Median),
+            SD = mean(SD),
+            Q1 = mean(Q1),
+            Q3 = mean(Q3),
+            IQR = mean(IQR),
+            Outliers.high = mean(Outliers.high),
+            Outliers.low = mean(Outliers.low))
+```
+
+```{r, results = 'asis'}
+aveStats.samples %>%
+  datatable() %>%
+  formatRound(columns = colnames(aveStats.samples), digits = 4)
+```
+
+## Class
+```{r}
+stats.class <- 
+  meltedData.RLM %>%
+  group_by(Class) %>%
+  summarise(Min = min(value.normalized),
+            Max = max(value.normalized),
+            Mean = mean(value.normalized),
+            Median = median(value.normalized),
+            SD = sd(value.normalized),
+            Q1 = summary(value.normalized)[2],
+            Q3 = summary(value.normalized)[5],
+            IQR = IQR(value.normalized))
+```
+
+```{r, results = 'asis'}
+stats.class %>%
+  datatable() %>%
+  formatRound(columns = colnames(stats.class), digits = 4)
+```
+
+### Average AD sample stats
+```{r}
+aveStats.samples.AD <-
+  stats.samples.AD %>%
+  summarise(Min = mean(Min),
+            Max = mean(Max),
+            Mean = mean(Mean),
+            Median = mean(Median),
+            SD = mean(SD),
+            Q1 = mean(Q1),
+            Q3 = mean(Q3),
+            IQR = mean(IQR),
+            Outliers.high = mean(Outliers.high),
+            Outliers.low = mean(Outliers.low))
+```
+
+```{r, results = 'asis'}
+aveStats.samples.AD %>%
+  datatable() %>%
+  formatRound(columns = colnames(aveStats.samples.AD), digits = 4)
+```
+
+### Average NDC sample stats
+```{r}
+aveStats.samples.NDC <-
+  stats.samples.NDC %>%
+  summarise(Min = mean(Min),
+            Max = mean(Max),
+            Mean = mean(Mean),
+            Median = mean(Median),
+            SD = mean(SD),
+            Q1 = mean(Q1),
+            Q3 = mean(Q3),
+            IQR = mean(IQR),
+            Outliers.high = mean(Outliers.high),
+            Outliers.low = mean(Outliers.low))
+```
+
+```{r, results = 'asis'}
+aveStats.samples.NDC %>%
+  datatable() %>%
+  formatRound(columns = colnames(aveStats.samples.NDC), digits = 4)
+```
+
+## Variables
+```{r}
+stats.features <- 
+  meltedData.RLM %>%
+  group_by(Feature) %>%
+  summarise(Min = min(value.normalized),
+            Max = max(value.normalized),
+            Mean = mean(value.normalized),
+            Median = median(value.normalized),
+            SD = sd(value.normalized),
+            Q1 = summary(value.normalized)[2],
+            Q3 = summary(value.normalized)[5],
+            IQR = IQR(value.normalized))
+
+```
+
+```{r, results = 'asis'}
+stats.features %>%
+  datatable() %>%
+  formatRound(columns = colnames(stats.features), digits = 4)
+```
+
+### Average autoantibody stats
+```{r}
+aveStats.features <-
+  stats.features %>%
+  summarise(Min = mean(Min),
+            Max = mean(Max),
+            Mean = mean(Mean),
+            Median = mean(Median),
+            SD = mean(SD),
+            Q1 = mean(Q1),
+            Q3 = mean(Q3),
+            IQR = mean(IQR))
+```
+
+```{r, results = 'asis'}
+aveStats.features %>%
+  datatable() %>%
+  formatRound(columns = colnames(aveStats.features), digits = 4)
+```
+
+### SNR of each autoantibody:
+```{r}
+aveStats.features.perClass <- 
+  meltedData.RLM %>%
+  group_by(Feature, Class) %>%
+  summarise(Min = min(value.normalized),
+            Max = max(value.normalized),
+            Mean = mean(value.normalized),
+            Median = median(value.normalized),
+            SD = sd(value.normalized),
+            Q1 = summary(value.normalized)[2],
+            Q3 = summary(value.normalized)[5],
+            IQR = IQR(value.normalized),
+            Var = var(value.normalized))
+
+SNR.features <-
+  aveStats.features.perClass %>%
+  group_by(Feature) %>%
+  summarize(S = (Mean[Class == "AD"] - Mean[Class == "NDC"])^2 / 
+              (Var[Class == "AD"] + Var[Class == "NDC"]))
+```
+
+```{r, results = 'asis'}
+SNR.features %>%
+  datatable() %>%
+  formatRound(columns = colnames(SNR.features), digits = 4)
+```
+
+### Distriubtion of Autoantibody SNRs
+```{r}
+summary(SNR.features$S)
+```
+
+## Summary stats of all data
+```{r}
+stats.signal <- 
+  meltedData.RLM %>%
+  summarise(Min = min(value.normalized),
+            Max = max(value.normalized),
+            Mean = mean(value.normalized),
+            Median = median(value.normalized),
+            SD = sd(value.normalized),
+            Q1 = summary(value.normalized)[2],
+            Q3 = summary(value.normalized)[5],
+            IQR = IQR(value.normalized))
+```
+
+```{r, results = 'asis'}
+stats.signal %>%
+  datatable() %>%
+  formatRound(columns = colnames(stats.signal), digits = 4)
+```
+
+# Array boxplots
+```{r}
+tiff(filename = file.path(EXPORT, "Array Boxplots RLM.tiff"),
+     width = 4000,
+     height = 2000,
+     pointsize = 10,
+     compression = "lzw",
+     res = 300)
+
+meltedData.RLM %>%
+  ggplot(aes(x = Sample,
+             y = value.normalized,
+             fill = Class)) +
+  geom_boxplot(outlier.size = .5,
+               outlier.alpha = .3,
+               outlier.color = "darkgrey") +
+  theme_bw() +
+  scale_y_continuous(limits = c(0, 16),
+                     breaks = seq(0, 16)) +
+  scale_fill_brewer(palette = "Set1") +
+  ylab(expression(bold(paste("Log"[bold(2)], " Expression")))) +
+  theme(axis.text.x = element_text(size = 6,
+                                   hjust = 1,
+                                   angle = 45),
+        axis.title.x = element_text(face = "bold"))
+dev.off()
+```
+
+# MA plots
+```{r plot.MAs}
+plot.MAs <- function(data.melted,
+                     value.var,
+                     need.to.log2 = F,
+                     samples) {
+  n.samples <- length(samples)
+  plotList <- list()
+  for (i in 1:n.samples){
+    sample <- samples[i]
+    plotList[[sample]] <- 
+      plot.MA(data.melted = data.melted,
+              array = sample,
+              value.var = value.var,
+              need.to.log2 = need.to.log2) +
+      scale_x_continuous(limits = c(0, 16),
+                         breaks = seq(0, 16, 
+                                      by = 2)) +
+      scale_y_continuous(limits = c(-14, 14),
+                         breaks = seq(-14, 14,
+                                      by = 2))
+  }
+  return(plotList)
+}
+```
+
+```{r}
+list.MAPlots <- plot.MAs(data.melt = meltedData.RLM,
+                         value.var = "value.normalized",
+                         need.to.log2 = F,
+                         samples = samples.MA)
+```
+
+```{r}
+tiff(filename = file.path(EXPORT, "MAPlots.RLM.tiff"),
+         width = 4000,
+         height = 4000,
+         pointsize = 25,
+         compression = "lzw",
+         res = 300)
+
+    ggplotGrid(list.MAPlots,
+           ncol = 3,
+           nrow = 3)
+    
+    dev.off()
+```
+
+# Save
+```{r Save}
+save(data.all,
+     metaData.samples,
+     metaData.features,
+     file = file.path(WORKSPACES,
+                      "RLM Output.RData"))
+```

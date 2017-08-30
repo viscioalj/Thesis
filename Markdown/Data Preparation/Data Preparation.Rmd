@@ -1,0 +1,784 @@
+---
+title: "Data Preparation"
+output:
+  html_document:
+    toc: yes
+  pdf_document:
+    toc: yes
+  word_document: null
+---
+
+```{r, include = F}
+knitr::opts_chunk$set(echo = F,
+                      eval = T,
+                      cache = F,
+                      message = F,
+                      warning = F)
+
+HOME <- "C:/Users/Owner/OneDrive/Thesis/Thesis R Project"
+DERIVED <- file.path(HOME, "Derived")
+MODELS <- file.path(DERIVED, "Models")
+WORKSPACES <- file.path(DERIVED, "WORKSPACES")
+EXPORT <- file.path(HOME, "Export")
+
+library(tidyr)
+library(MASS)
+library(gridExtra)
+library(miscset)
+library(PAA)
+library(limma)
+library(knitr)
+library(doParallel)
+library(Hmisc)
+library(e1071)
+library(randomForest)
+library(kernlab)
+library(caret)
+library(dplyr)
+library(reshape2)
+library(ggplot2)
+library(DT)
+
+gpr.path <- file.path(HOME, "Import",
+                      "2011 and 2013 AD and NDC RAW GPR files")
+
+targets.path <- file.path(HOME, "Import",
+                          "AD Targets File.txt")
+```
+
+# Setup
+```{r}
+load(file.path(WORKSPACES,
+               "Custom Functions.RData"))
+```
+
+# Upload data
+```{r custom.loadGPR.run, results = "hide"}
+elist.firstLoad <- 
+  loadGPR_withSpotQuality(gpr.path = gpr.path, 
+                          targets.path = targets.path,
+                          array.type = "ProtoArray", 
+                          protoarray.aggregation = "min",
+                          array.columns = list(E = "F635 Median", 
+                                               Eb = "B635 Median"),
+                          array.annotation = c("Block", 
+                                               "Column", 
+                                               "Row", 
+                                               "Description", 
+                                               "Name", 
+                                               "ID"),
+                          array.spotQuality = c("F635 % Sat.", 
+                                                "SNR 635"))
+```
+
+```{r}
+elist.data <- elist.firstLoad$elist.data
+elist.controls <- elist.firstLoad$elist.controls
+```
+
+# Quality control filter
+Filter out autoantibodies that have greater than or equal to 2 average percent saturation.
+```{r}
+QC <- as.data.frame(elist.data$other)[, 1:123]
+colnames(QC) <- elist.firstLoad$metaData.samples$ArrayID
+QC$Feature <- elist.data$genes$ID
+
+melt.QC <- melt(QC,
+                id.vars = "Feature",
+                variable.name = "Sample",
+                value.name = "percent.Sat")
+features.QC.fail <-
+  melt.QC %>%
+  group_by(Feature) %>%
+  summarize(Sat.average = mean(percent.Sat)) %>%
+  filter(Sat.average >= 2) %>%
+  select(Feature) %>%
+  unlist()
+```
+
+metaData of filtered autoantibodies
+```{r metaData.features.QC.fail, results = 'asis'}
+metaData.features.QC.fail <-
+  elist.data$genes %>%
+  filter(ID %in% features.QC.fail)
+
+metaData.features.QC.fail %>%
+  select(ID, Description) %>%
+  kable(format = "pandoc")
+```
+
+Discard filtered autoantibodies from E, Eb, and genes in elist.data:
+```{r}
+elist.data$E %>%
+  t() %>%
+  as.data.frame() %>%
+  select(-one_of(features.QC.fail)) %>%
+  t() ->
+  elist.data$E
+
+elist.data$Eb %>%
+  t() %>%
+  as.data.frame() %>%
+  select(-one_of(features.QC.fail)) %>%
+  t() ->
+  elist.data$Eb
+
+elist.data$genes <-
+  elist.data$genes %>%
+  filter(ID %nin% features.QC.fail)
+```
+
+# Metadata of samples and features
+```{r}
+metaData.samples <- elist.firstLoad$metaData.samples
+metaData.features <- elist.data$genes
+metaData.controls <- elist.controls$genes
+```
+
+# EDA
+Melted autoantibody data
+```{r}
+data.firstLoad <- as.data.frame(t(elist.data$E))
+data.firstLoad$Sample <- rownames(data.firstLoad)
+rownames(data.firstLoad) <- NULL
+
+meltedData <- melt(data.firstLoad,
+                   id.vars = "Sample",
+                   variable.name = "Feature")
+```
+
+Melted control data
+```{r}
+controls.firstLoad <- as.data.frame(t(elist.controls$E))
+colnames(controls.firstLoad) <- metaData.controls$ID
+controls.firstLoad$Sample <- rownames(controls.firstLoad)
+rownames(controls.firstLoad) <- NULL
+
+meltedControls <- melt(controls.firstLoad,
+                       id.vars = "Sample",
+                       variable.name = "Feature")
+```
+
+## Summary Statistics - Autoantibodies
+```{r}
+meltedData$value <- log2(meltedData$value)
+meltedData <-
+  meltedData %>%
+  mutate(Class = if_else(grepl(pattern = "^(AD)", 
+                               x = Sample, perl = T), 
+                         "AD", 
+                         "NDC"))
+```
+
+### Sample stats
+```{r}
+stats.samples <-
+  meltedData %>%
+  group_by(Sample) %>%
+  summarise(Min = min(value),
+            Max = max(value),
+            Mean = mean(value),
+            Median = median(value),
+            SD = sd(value),
+            Q1 = summary(value)[2],
+            Q3 = summary(value)[5],
+            IQR = IQR(value),
+            Outliers.high = sum(value > Q3 + (1.5 * IQR)),
+            Outliers.low = sum(value < Q1 - (1.5 * IQR)))
+```
+
+
+```{r, results = 'asis'}
+stats.samples %>%
+  datatable() %>%
+  formatRound(columns = colnames(stats.samples), digits = 4)
+```
+
+#### AD sample stats
+```{r}
+stats.samples.AD <- 
+  meltedData %>%
+  filter(Class == "AD") %>%
+  group_by(Sample) %>%
+  summarise(Min = min(value),
+            Max = max(value),
+            Mean = mean(value),
+            Median = median(value),
+            SD = sd(value),
+            Q1 = summary(value)[2],
+            Q3 = summary(value)[5],
+            IQR = IQR(value),
+            Outliers.high = sum(value > Q3 + (1.5 * IQR)),
+            Outliers.low = sum(value < Q1 - (1.5 * IQR)))
+```
+
+```{r, results = 'asis'}
+stats.samples.AD %>%
+  datatable() %>%
+  formatRound(columns = colnames(stats.samples.AD), digits = 4)
+```
+
+#### NDC sample stats
+```{r}
+stats.samples.NDC <- 
+  meltedData %>%
+  filter(Class == "NDC") %>%
+  group_by(Sample) %>%
+  summarise(Min = min(value),
+            Max = max(value),
+            Mean = mean(value),
+            Median = median(value),
+            SD = sd(value),
+            Q1 = summary(value)[2],
+            Q3 = summary(value)[5],
+            IQR = IQR(value),
+            Outliers.high = sum(value > Q3 + (1.5 * IQR)),
+            Outliers.low = sum(value < Q1 - (1.5 * IQR)))
+```
+
+```{r, results = 'asis'}
+stats.samples.NDC %>%
+  datatable() %>%
+  formatRound(columns = colnames(stats.samples.NDC), digits = 4)
+```
+
+#### Average sample stats
+```{r}
+aveStats.samples <-
+  stats.samples %>%
+  summarise(Min = mean(Min),
+            Max = mean(Max),
+            Mean = mean(Mean),
+            Median = mean(Median),
+            SD = mean(SD),
+            Q1 = mean(Q1),
+            Q3 = mean(Q3),
+            IQR = mean(IQR),
+            Outliers.high = mean(Outliers.high),
+            Outliers.low = mean(Outliers.low))
+```
+
+```{r, results = 'asis'}
+aveStats.samples %>%
+  datatable() %>%
+  formatRound(columns = colnames(aveStats.samples), digits = 4)
+```
+
+### Class
+```{r}
+stats.class <- 
+  meltedData %>%
+  group_by(Class) %>%
+  summarise(Min = min(value),
+            Max = max(value),
+            Mean = mean(value),
+            Median = median(value),
+            SD = sd(value),
+            Q1 = summary(value)[2],
+            Q3 = summary(value)[5],
+            IQR = IQR(value))
+```
+
+```{r, results = 'asis'}
+stats.class %>%
+  datatable() %>%
+  formatRound(columns = colnames(stats.class), digits = 4)
+```
+
+#### Average AD sample stats
+```{r}
+aveStats.samples.AD <-
+  stats.samples.AD %>%
+  summarise(Min = mean(Min),
+            Max = mean(Max),
+            Mean = mean(Mean),
+            Median = mean(Median),
+            SD = mean(SD),
+            Q1 = mean(Q1),
+            Q3 = mean(Q3),
+            IQR = mean(IQR),
+            Outliers.high = mean(Outliers.high),
+            Outliers.low = mean(Outliers.low))
+```
+
+```{r, results = 'asis'}
+aveStats.samples.AD %>%
+  datatable() %>%
+  formatRound(columns = colnames(aveStats.samples.AD), digits = 4)
+```
+
+#### Average NDC sample stats
+```{r}
+aveStats.samples.NDC <-
+  stats.samples.NDC %>%
+  summarise(Min = mean(Min),
+            Max = mean(Max),
+            Mean = mean(Mean),
+            Median = mean(Median),
+            SD = mean(SD),
+            Q1 = mean(Q1),
+            Q3 = mean(Q3),
+            IQR = mean(IQR),
+            Outliers.high = mean(Outliers.high),
+            Outliers.low = mean(Outliers.low))
+```
+
+```{r, results = 'asis'}
+aveStats.samples.NDC %>%
+  datatable() %>%
+  formatRound(columns = colnames(aveStats.samples.NDC), digits = 4)
+```
+
+### Variables
+```{r}
+stats.features <- 
+  meltedData %>%
+  group_by(Feature) %>%
+  summarise(Min = min(value),
+            Max = max(value),
+            Mean = mean(value),
+            Median = median(value),
+            SD = sd(value),
+            Q1 = summary(value)[2],
+            Q3 = summary(value)[5],
+            IQR = IQR(value))
+
+```
+
+```{r, results = 'asis'}
+stats.features %>%
+  datatable() %>%
+  formatRound(columns = colnames(stats.features), digits = 4)
+```
+
+#### Average autoantibody stats
+```{r}
+aveStats.features <-
+  stats.features %>%
+  summarise(Min = mean(Min),
+            Max = mean(Max),
+            Mean = mean(Mean),
+            Median = mean(Median),
+            SD = mean(SD),
+            Q1 = mean(Q1),
+            Q3 = mean(Q3),
+            IQR = mean(IQR))
+```
+
+```{r, results = 'asis'}
+aveStats.features %>%
+  datatable() %>%
+  formatRound(columns = colnames(aveStats.features), digits = 4)
+```
+
+#### SNR of each autoantibody:
+```{r}
+aveStats.features.perClass <- 
+  meltedData %>%
+  group_by(Feature, Class) %>%
+  summarise(Min = min(value),
+            Max = max(value),
+            Mean = mean(value),
+            Median = median(value),
+            SD = sd(value),
+            Q1 = summary(value)[2],
+            Q3 = summary(value)[5],
+            IQR = IQR(value),
+            Var = var(value))
+
+SNR.features <-
+  aveStats.features.perClass %>%
+  group_by(Feature) %>%
+  summarize(S = (Mean[Class == "AD"] - Mean[Class == "NDC"])^2 / 
+              (Var[Class == "AD"] + Var[Class == "NDC"]))
+```
+
+```{r, results = 'asis'}
+SNR.features %>%
+  datatable() %>%
+  formatRound(columns = colnames(SNR.features), digits = 4)
+```
+
+#### Distriubtion of Autoantibody SNRs
+```{r}
+summary(SNR.features$S)
+```
+
+### Summary stats of all data
+```{r}
+stats.signal <- 
+  meltedData %>%
+  summarise(Min = min(value),
+            Max = max(value),
+            Mean = mean(value),
+            Median = median(value),
+            SD = sd(value),
+            Q1 = summary(value)[2],
+            Q3 = summary(value)[5],
+            IQR = IQR(value))
+```
+
+```{r, results = 'asis'}
+stats.signal %>%
+  datatable() %>%
+  formatRound(columns = colnames(stats.signal), digits = 4)
+```
+
+## Summary Statistics - Controls
+```{r}
+meltedControls$value <- log2(meltedControls$value)
+meltedControls <-
+  meltedControls %>%
+  mutate(Class = if_else(grepl(pattern = "^(AD)", 
+                               x = Sample, perl = T), 
+                         "AD", 
+                         "NDC"))
+
+```
+
+### Sample stats
+```{r}
+stats.samples.ctrls <-
+  meltedControls %>%
+  group_by(Sample) %>%
+  summarise(Min = min(value),
+            Max = max(value),
+            Mean = mean(value),
+            Median = median(value),
+            SD = sd(value),
+            Q1 = summary(value)[2],
+            Q3 = summary(value)[5],
+            IQR = IQR(value),
+            Outliers.high = sum(value > Q3 + (1.5 * IQR)),
+            Outliers.low = sum(value < Q1 - (1.5 * IQR)))
+```
+
+
+```{r, results = 'asis'}
+stats.samples.ctrls %>%
+  datatable() %>%
+  formatRound(columns = colnames(stats.samples.ctrls), digits = 4)
+```
+
+#### AD sample stats
+```{r}
+stats.samples.AD.ctrls <- 
+  meltedControls %>%
+  filter(Class == "AD") %>%
+  group_by(Sample) %>%
+  summarise(Min = min(value),
+            Max = max(value),
+            Mean = mean(value),
+            Median = median(value),
+            SD = sd(value),
+            Q1 = summary(value)[2],
+            Q3 = summary(value)[5],
+            IQR = IQR(value),
+            Outliers.high = sum(value > Q3 + (1.5 * IQR)),
+            Outliers.low = sum(value < Q1 - (1.5 * IQR)))
+```
+
+```{r, results = 'asis'}
+stats.samples.AD.ctrls %>%
+  datatable() %>%
+  formatRound(columns = colnames(stats.samples.AD.ctrls), digits = 4)
+```
+
+#### NDC sample stats
+```{r}
+stats.samples.NDC.ctrls <- 
+  meltedControls %>%
+  filter(Class == "NDC") %>%
+  group_by(Sample) %>%
+  summarise(Min = min(value),
+            Max = max(value),
+            Mean = mean(value),
+            Median = median(value),
+            SD = sd(value),
+            Q1 = summary(value)[2],
+            Q3 = summary(value)[5],
+            IQR = IQR(value),
+            Outliers.high = sum(value > Q3 + (1.5 * IQR)),
+            Outliers.low = sum(value < Q1 - (1.5 * IQR)))
+```
+
+```{r, results = 'asis'}
+stats.samples.NDC.ctrls %>%
+  datatable() %>%
+  formatRound(columns = colnames(stats.samples.NDC.ctrls), digits = 4)
+```
+
+#### Average sample stats
+```{r}
+aveStats.samples.ctrls <-
+  stats.samples.ctrls %>%
+  summarise(Min = mean(Min),
+            Max = mean(Max),
+            Mean = mean(Mean),
+            Median = mean(Median),
+            SD = mean(SD),
+            Q1 = mean(Q1),
+            Q3 = mean(Q3),
+            IQR = mean(IQR),
+            Outliers.high = mean(Outliers.high),
+            Outliers.low = mean(Outliers.low))
+```
+
+```{r, results = 'asis'}
+aveStats.samples.ctrls %>%
+  datatable() %>%
+  formatRound(columns = colnames(aveStats.samples.ctrls), digits = 4)
+```
+
+### Class
+```{r}
+stats.class.ctrls <- 
+  meltedControls %>%
+  group_by(Class) %>%
+  summarise(Min = min(value),
+            Max = max(value),
+            Mean = mean(value),
+            Median = median(value),
+            SD = sd(value),
+            Q1 = summary(value)[2],
+            Q3 = summary(value)[5],
+            IQR = IQR(value))
+```
+
+```{r, results = 'asis'}
+stats.class.ctrls %>%
+  datatable() %>%
+  formatRound(columns = colnames(stats.class.ctrls), digits = 4)
+```
+
+#### Average AD sample stats
+```{r}
+aveStats.samples.AD.ctrls <-
+  stats.samples.AD.ctrls %>%
+  summarise(Min = mean(Min),
+            Max = mean(Max),
+            Mean = mean(Mean),
+            Median = mean(Median),
+            SD = mean(SD),
+            Q1 = mean(Q1),
+            Q3 = mean(Q3),
+            IQR = mean(IQR),
+            Outliers.high = mean(Outliers.high),
+            Outliers.low = mean(Outliers.low))
+```
+
+```{r, results = 'asis'}
+aveStats.samples.AD.ctrls %>%
+  datatable() %>%
+  formatRound(columns = colnames(aveStats.samples.AD.ctrls), digits = 4)
+```
+
+#### Average NDC sample stats
+```{r}
+aveStats.samples.NDC.ctrls <-
+  stats.samples.NDC.ctrls %>%
+  summarise(Min = mean(Min),
+            Max = mean(Max),
+            Mean = mean(Mean),
+            Median = mean(Median),
+            SD = mean(SD),
+            Q1 = mean(Q1),
+            Q3 = mean(Q3),
+            IQR = mean(IQR),
+            Outliers.high = mean(Outliers.high),
+            Outliers.low = mean(Outliers.low))
+```
+
+```{r, results = 'asis'}
+aveStats.samples.NDC.ctrls %>%
+  datatable() %>%
+  formatRound(columns = colnames(aveStats.samples.NDC.ctrls), digits = 4)
+```
+
+### Variables
+```{r}
+stats.features.ctrls <- 
+  meltedControls %>%
+  group_by(Feature) %>%
+  summarise(Min = min(value),
+            Max = max(value),
+            Mean = mean(value),
+            Median = median(value),
+            SD = sd(value),
+            Q1 = summary(value)[2],
+            Q3 = summary(value)[5],
+            IQR = IQR(value))
+
+```
+
+```{r, results = 'asis'}
+stats.features.ctrls %>%
+  datatable() %>%
+  formatRound(columns = colnames(stats.features.ctrls), digits = 4)
+```
+
+#### Average control protein stats
+```{r}
+aveStats.features.ctrls <-
+  stats.features.ctrls %>%
+  summarise(Min = mean(Min),
+            Max = mean(Max),
+            Mean = mean(Mean),
+            Median = mean(Median),
+            SD = mean(SD),
+            Q1 = mean(Q1),
+            Q3 = mean(Q3),
+            IQR = mean(IQR))
+```
+
+```{r, results = 'asis'}
+aveStats.features.ctrls %>%
+  datatable() %>%
+  formatRound(columns = colnames(aveStats.features.ctrls), digits = 4)
+```
+
+### Summary stats of all data
+```{r}
+stats.signal.ctrls <- 
+  meltedControls %>%
+  summarise(Min = min(value),
+            Max = max(value),
+            Mean = mean(value),
+            Median = median(value),
+            SD = sd(value),
+            Q1 = summary(value)[2],
+            Q3 = summary(value)[5],
+            IQR = IQR(value))
+```
+
+```{r, results = 'asis'}
+stats.signal.ctrls %>%
+  datatable() %>%
+  formatRound(columns = colnames(stats.signal.ctrls), digits = 4)
+```
+
+## Plots
+### Array boxplots
+Autoantibodies:
+```{r}
+tiff(filename = file.path(EXPORT,
+                          "Array Boxplots dataPrep.tiff"),
+     width = 4000,
+     height = 2000,
+     compression = "lzw",
+     pointsize = 10,
+     res = 300)
+meltedData %>%
+  ggplot(aes(x = Sample,
+             y = value,
+             fill = Class)) +
+  geom_boxplot(outlier.size = .5,
+               outlier.alpha = .3,
+               outlier.color = "darkgrey") +
+  theme_bw() +
+  scale_y_continuous(limits = c(0, 16),
+                     breaks = seq(0, 16)) +
+  scale_fill_brewer(palette = "Set1") +
+  ylab(expression(bold(paste("Log"[bold(2)], " Expression")))) +
+  theme(axis.text.x = element_text(size = 6,
+                                   hjust = 1,
+                                   angle = 45),
+        axis.title.x = element_text(face = "bold"))
+dev.off()
+```
+
+Controls:
+```{r}
+tiff(filename = file.path(EXPORT,
+                          "Array Boxplots dataPrep controls.tiff"),
+     width = 4000,
+     height = 2000,
+     pointsize = 10,
+     compression = "lzw",
+     res = 300)
+
+meltedControls %>%
+  ggplot(aes(x = Sample,
+             y = value,
+             fill = Class)) +
+  geom_boxplot(outlier.size = .5,
+               outlier.alpha = .3,
+               outlier.color = "darkgrey") +
+  theme_bw() +
+  scale_y_continuous(limits = c(0, 16),
+                     breaks = seq(0, 16)) +
+  scale_fill_brewer(palette = "Set1") +
+  ylab(expression(bold(paste("Log"[bold(2)], " Expression")))) +
+  theme(axis.text.x = element_text(size = 6,
+                                   hjust = 1,
+                                   angle = 45),
+        axis.title.x = element_text(face = "bold"))
+dev.off()
+```
+
+### MA plots
+```{r}
+set.seed(10)
+samples.MA <- sample(unique(meltedData$Sample), size = 9)
+save(samples.MA, file = file.path(DERIVED, "samples.MA.RData"))
+```
+
+Creates a list of MA plots for a set of samples in a melted dataset.
+```{r plot.MAs}
+plot.MAs <- function(data.melted,
+                     value.var,
+                     need.to.log2 = F,
+                     samples) {
+  n.samples <- length(samples)
+  plotList <- list()
+  for (i in 1:n.samples){
+    sample <- samples[i]
+    plotList[[sample]] <- 
+      plot.MA(data.melted = data.melted,
+              array = sample,
+              value.var = value.var,
+              need.to.log2 = need.to.log2) +
+      scale_x_continuous(limits = c(5, 16),
+                         breaks = seq(6, 16, 
+                                      by = 2)) +
+      scale_y_continuous(limits = c(-8, 8),
+                         breaks = seq(-8, 8,
+                                      by = 2))
+  }
+  return(plotList)
+}
+```
+
+```{r}
+list.MAPlots <- plot.MAs(data.melt = meltedData,
+                         value.var = "value",
+                         need.to.log2 = F,
+                         samples = samples.MA)
+```
+
+```{r}
+tiff(filename = file.path(EXPORT, "MAPlots.dataPrep.tiff"),
+         width = 4000,
+         height = 4000,
+         pointsize = 25,
+         compression = "lzw",
+         res = 300)
+
+    ggplotGrid(list.MAPlots,
+           ncol = 3,
+           nrow = 3)
+    
+    dev.off()
+```
+
+# Save
+Data Preparation Output workspace:
+```{r Save}
+save(elist.data,
+     elist.controls,
+     metaData.samples,
+     metaData.features,
+     metaData.controls,
+     file = file.path(WORKSPACES,
+                      "Data Preparation Output.RData"))
+```

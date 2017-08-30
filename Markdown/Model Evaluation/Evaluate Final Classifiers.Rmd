@@ -1,0 +1,297 @@
+---
+title: "Evaluate Final Classifiers"
+output:
+  html_document:
+    toc: yes
+  pdf_document:
+    toc: yes
+  word_document: null
+---
+
+```{r setup, include = F}
+knitr::opts_chunk$set(echo = T,
+                      eval = T,
+                      cache = F,
+                      message = F,
+                      warning = F)
+
+HOME <- "C:/Users/Owner/OneDrive/Thesis/Thesis R Project"
+DERIVED <- file.path(HOME, "Derived")
+MODELS <- file.path(DERIVED, "Models")
+WORKSPACES <- file.path(DERIVED, "WORKSPACES")
+EXPORT <- file.path(HOME, "Export")
+```
+
+# Setup
+```{r load.packages, include = F}
+library(tidyr)
+library(MASS)
+library(gridExtra)
+library(miscset)
+library(PAA)
+library(limma)
+library(knitr)
+library(doParallel)
+library(Hmisc)
+library(e1071)
+library(randomForest)
+library(kernlab)
+library(caret)
+library(dplyr)
+library(reshape2)
+library(ggplot2)
+library(caTools)
+```
+
+```{r load.workspaces, include = F}
+load(file = file.path(WORKSPACES,
+                      "Modeling-Ready Workspace.RData"))
+
+load(file = file.path(WORKSPACES,
+                      "Custom Functions.RData"))
+```
+
+```{r load.models, include = F}
+load(file = file.path(MODELS,
+                      "finalRF.RData"))
+load(file = file.path(MODELS,
+                      "finalSVM.RData"))
+```
+
+```{r load.biomarkers, include = F}
+load(file = file.path(DERIVED,
+                      "biomarker.RF.RData"))
+load(file = file.path(DERIVED,
+                      "biomarker.SVM.RData"))
+```
+
+# Comparison of Resampling Performance
+```{r}
+resamp <- resamples(list(RF = finalRF, 
+                         SVM = finalSVM))
+modelDifferences <- diff(resamp)
+```
+
+95% confidence intervals of average resampled performance measures.
+```{r}
+resamp.RF <- 
+  finalRF$resample %>%
+  filter(mtry == 2) %>%
+  select(-mtry, -Kappa) %>%
+  mutate(Model = rep("RF", 500))
+resamp.RF$Resample <- c(1:500)
+
+
+resamp.SVM <-
+  finalSVM$resample %>%
+  filter(C == 0.25) %>%
+  select(-C, -Kappa) %>%
+  mutate(Model = rep("SVM", 500))
+
+resamp.SVM$Resample <- c(1:500)
+
+resampDF <- bind_rows(resamp.RF, resamp.SVM)
+meltedResamp <- melt(resampDF,
+                     id.vars = c("Resample", "Model"))
+```
+
+```{r}
+tiff(filename = file.path(EXPORT, "Resamp Conf Intervals.tiff"),
+     width = 2000,
+     height = 2000,
+     compression = "lzw",
+     res = 300)
+
+meltedResamp %>%
+  group_by(variable, Model) %>%
+  summarize(Mean = mean(value),
+            SD = sd(value),
+            LB = Mean - 1.96*(SD/sqrt(500)),
+            UB = Mean + 1.96*(SD/sqrt(500))) %>%
+  ggplot(aes(x = variable,
+             y = Mean,
+             color = factor(Model))) +
+  geom_pointrange(aes(ymin = LB, ymax = UB)) +
+  theme_bw() +
+  coord_flip() +
+  xlab("Evaluation Metric") +
+  scale_color_brewer(name = "Model",
+                     type = "qual",
+                     palette = "Set1") +
+  theme(axis.title = element_text(face = "bold"),
+        axis.title.x = element_blank(),
+        legend.title = element_text(face = "bold"))
+
+dev.off()
+
+```
+
+Paired sample t-tests.
+```{r}
+OOBAUC.RF <- resamp.RF$AUC
+OOBAUC.SVM <- resamp.SVM$AUC
+
+OOBAcc.RF <- resamp.RF$Accuracy
+OOBAcc.SVM <- resamp.SVM$Accuracy
+
+OOBSens.RF <- resamp.RF$Sens
+OOBSens.SVM <- resamp.SVM$Sens
+
+OOBSpec.RF <- resamp.RF$Spec
+OOBSpec.SVM <- resamp.SVM$Spec
+```
+
+AUC
+```{r}
+t.test(OOBAUC.RF, OOBAUC.SVM, paired = T)
+```
+
+Accuracy
+```{r}
+t.test(OOBAcc.RF, OOBAcc.SVM, paired = T)
+```
+
+Sensitivity
+```{r}
+t.test(OOBSens.RF, OOBSens.SVM, paired = T)
+```
+
+Specificity
+```{r}
+t.test(OOBSpec.RF, OOBSpec.SVM, paired = T)
+```
+
+# Evaluation on Test Set
+## RF
+Confusion matrix
+```{r}
+pred.RF <- predict(finalRF, 
+                   data.test[, biomarker.RF])
+confusionMatrix(pred.RF, 
+                classVector.test, 
+                positive = "AD")
+```
+
+```{r}
+pred.prob.RF <- predict(finalRF, 
+                        data.test[, biomarker.RF], 
+                        type = "prob")
+probs.RF <- pred.prob.RF
+probs.RF$Sample <- rownames(probs.RF)
+probs.RF$NDC <- NULL
+
+probs.AD.RF <- probs.RF %>%
+  filter(grepl(pattern = "^(AD)", 
+               Sample))
+
+probs.NDC.RF <- probs.RF %>%
+  filter(!grepl(pattern = "^(AD)", 
+                Sample))
+```
+
+prediction probabilities for AD samples
+```{r, results = 'asis'}
+probs.AD.RF %>%
+  kable(digits = 4)
+```
+
+prediction probabilities for NDC samples
+```{r, results = 'asis'}
+probs.NDC.RF %>%
+  kable(digits = 4)
+```
+
+ROC Curve Plots.
+```{r}
+df.RF <- data_frame(pred = pred.prob.RF$AD,
+                    act = classVector.test)
+roc.RF <- computeROC(df.RF, 
+                     n = 1000)
+```
+
+```{r}
+tiff(filename = file.path(EXPORT,
+                          "RF ROC Plots.tiff"),
+     width = 5.57,
+     height = 2.81,
+     units = "in",
+     compression = "lzw",
+     res = 200)
+
+plots.roc(roc.RF, .5, "Random Forest")
+
+dev.off()
+```
+
+Calculate test set AUC.
+```{r}
+trapz(roc.RF$fpr, 
+      roc.RF$tpr)
+```
+
+## SVM
+Confusion matrix
+```{r}
+pred.SVM <- predict(finalSVM, 
+                    data.test[, biomarker.SVM])
+confusionMatrix(pred.SVM, 
+                classVector.test, 
+                positive = "AD")
+```
+
+```{r}
+pred.prob.SVM <- predict(finalSVM, 
+                         data.test[, biomarker.SVM], 
+                         type = "prob")
+probs.SVM <- pred.prob.SVM
+probs.SVM$Sample <- probs.RF$Sample
+probs.SVM$NDC <- NULL
+
+probs.AD.SVM <- probs.SVM %>%
+  filter(grepl(pattern = "^(AD)", 
+               Sample))
+
+probs.NDC.SVM <- probs.SVM %>%
+  filter(!grepl(pattern = "^(AD)", 
+                Sample))
+```
+
+prediction probabilities for AD samples
+```{r, results = 'asis'}
+probs.AD.SVM %>%
+  kable(digits = 4)
+```
+
+prediction probabilities for NDC samples
+```{r, results = 'asis'}
+probs.NDC.SVM %>%
+  kable(digits = 4)
+```
+
+ROC Curve Plots.
+```{r}
+df.SVM <- data_frame(pred = pred.prob.SVM$AD,
+                    act = classVector.test)
+roc.SVM <- computeROC(df.SVM, 
+                      n = 1000)
+```
+
+```{r}
+tiff(filename = file.path(EXPORT,
+                          "SVM ROC Plots.tiff"),
+     width = 5.57,
+     height = 2.81,
+     units = "in",
+     compression = "lzw",
+     res = 200)
+
+plots.roc(roc.SVM, .5, "Support Vector Machine")
+
+dev.off()
+```
+
+Calculate test set AUC.
+```{r}
+trapz(roc.SVM$fpr, 
+      roc.SVM$tpr)
+```

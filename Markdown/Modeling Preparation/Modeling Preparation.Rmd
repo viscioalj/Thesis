@@ -1,0 +1,167 @@
+---
+output:
+  html_document:
+    toc: yes
+  pdf_document:
+    toc: yes
+  word_document: null
+---
+
+# Modeling Preparation
+## Setup
+```{r setup, include = F}
+knitr::opts_chunk$set(echo = T,
+                      eval = F,
+                      cache = F,
+                      message = F,
+                      warning = F)
+
+HOME <- "C:/Users/Owner/OneDrive/Thesis/Thesis R Project"
+DERIVED <- file.path(HOME, "Derived")
+MODELS <- file.path(DERIVED, "Models")
+WORKSPACES <- file.path(DERIVED, "WORKSPACES")
+EXPORT <- file.path(HOME, "Export")
+
+library(tidyr)
+library(MASS)
+library(gridExtra)
+library(miscset)
+library(PAA)
+library(limma)
+library(knitr)
+library(doParallel)
+library(Hmisc)
+library(e1071)
+library(randomForest)
+library(kernlab)
+library(caret)
+library(dplyr)
+library(reshape2)
+library(ggplot2)
+```
+
+
+```{r loadFiles}
+load(file.path(WORKSPACES,
+               "RLM Output.RData"))
+load(file.path(WORKSPACES,
+               "Custom Functions.RData"))
+```
+
+## Partition into training/test sets
+```{r}
+classVector <- factor(metaData.samples$Group, 
+                      levels = c("NDC", "AD"))
+
+set.seed(6)
+inTraining <- createDataPartition(y = classVector, 
+                                  times = 1, 
+                                  p = 0.7, 
+                                  list=FALSE)
+
+data.training <- data.all[inTraining, ]
+data.test <- data.all[-inTraining, ]
+
+classVector.training <- classVector[inTraining]
+classVector.test <- classVector[-inTraining]
+
+samples.training <- metaData.samples$ArrayID[inTraining]
+samples.test <- metaData.samples$ArrayID[-inTraining]
+```
+
+```{r}
+samples.AD <- 
+  metaData.samples %>%
+  filter(Group == "AD") %>%
+  select(ArrayID) %>%
+  unlist()
+
+set.seed(6)
+random5 <- sample(samples.test[which(samples.test %in% samples.AD)],
+                  size = 5,
+                  replace = FALSE)
+inTraining <- c(inTraining, 
+                which(metaData.samples$ArrayID %in% random5))
+```
+
+```{r}
+data.training <- data.all[inTraining, ]
+data.test <- data.all[-inTraining, ]
+
+classVector.training <- classVector[inTraining]
+classVector.test <- classVector[-inTraining]
+
+samples.training <- metaData.samples$ArrayID[inTraining]
+samples.test <- metaData.samples$ArrayID[-inTraining]
+```
+
+## 500 bootstrap resamples of training set
+```{r}
+set.seed(10)
+resamples <- createResample(y = classVector.training,
+                            times = 500)
+```
+
+## Feature subset sizes (FSS) to evaluate in rfe
+```{r}
+FSS.rerank <- c(2:30,
+                37,
+                74,
+                148,
+                296,
+                591,
+                1181,
+                2361,
+                4722,
+                9444)
+```
+
+## Seeds to use with rfe
+These allow for reproducible results when the model is trained using parallel processing.
+```{r}
+seeds.rerank <- vector(mode = "list", 
+                       length = 501)
+for(i in 1:500){
+  seeds.rerank[[i]] <- sample.int(n=1000, 38)
+}
+seeds.rerank[[501]] <- sample.int(n = 1000, 1)
+```
+
+## trainControl parameter settings
+```{r}
+trCtrl <- trainControl(method = "boot",
+                       number = 500,
+                       returnResamp = "all",
+                       savePredictions = T,
+                       classProbs = T,
+                       selectionFunction = "best",
+                       summaryFunction = summary.fiveStats,
+                       allowParallel = T)
+
+trCtrl.RFE <- trainControl(method = "none",
+                           savePredictions = T,
+                           classProbs = T,
+                           selectionFunction = "best",
+                           summaryFunction = summary.fiveStats,
+                           allowParallel = F)
+```
+
+## rfeControl parameter settings
+```{r}
+rfeCtrl.rerank <- rfeControl(rerank = T,
+                             method="boot",
+                             saveDetails = T,
+                             number = 500, 
+                             index = resamples,
+                             seeds = seeds.rerank,
+                             verbose = F,
+                             returnResamp = "all",
+                             allowParallel = T)
+```
+
+## Save
+```{r}
+save.image(file.path(WORKSPACES,
+                     "Modeling-Ready Workspace.RData"))
+```
+
